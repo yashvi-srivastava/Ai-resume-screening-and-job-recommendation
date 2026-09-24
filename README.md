@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AI-Based Intelligent Resume Screening and Job Recommendation System
 
 A beginner-friendly B.Tech mini project that extracts information from resumes, compares resumes with real job records, and recommends relevant jobs through Streamlit.
