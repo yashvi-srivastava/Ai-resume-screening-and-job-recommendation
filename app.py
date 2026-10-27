@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import tempfile
 from pathlib import Path
 
 import streamlit as st
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("resume_app")
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
@@ -29,11 +33,18 @@ def get_jobs():
 
 def parse_uploaded_resume(uploaded_file) -> str:
     suffix = Path(uploaded_file.name).suffix.lower()
+    file_bytes = uploaded_file.getvalue()  # bytes of the upload (works on Streamlit Cloud)
+    # Log only the type and size - never the file name or content.
+    logger.info("Upload received: type=%s, size=%d bytes", suffix, len(file_bytes))
+    if not file_bytes:
+        raise ValueError("The uploaded file is empty (0 bytes). Please upload the resume again.")
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary_file:
-        temporary_file.write(uploaded_file.getvalue())
+        temporary_file.write(file_bytes)
         temporary_path = temporary_file.name
     try:
-        return parse_resume(temporary_path)
+        # preserve_layout keeps line breaks so Projects/Certifications can be found.
+        return parse_resume(temporary_path, preserve_layout=True)
     finally:
         Path(temporary_path).unlink(missing_ok=True)
 
@@ -67,8 +78,17 @@ try:
 except (OSError, ValueError) as error:
     st.error(f"Resume processing failed: {error}")
     st.stop()
+except Exception as error:  # unexpected parser failure: show a clean message, log the type only
+    logger.error("Unexpected resume parsing error (%s)", type(error).__name__)
+    st.error("The resume could not be processed. Please try another file or export it again as PDF/DOCX.")
+    st.stop()
 
 profile = extract_profile(resume_text)
+logger.info(
+    "Profile extracted: characters=%d, lines=%d, skills=%d, projects_chars=%d, certifications_chars=%d",
+    len(resume_text), resume_text.count("\n") + 1, len(profile["skills"]),
+    len(profile["projects"]), len(profile["certifications"]),
+)
 
 st.subheader("Extracted Resume Information")
 profile_left, profile_right = st.columns(2)
@@ -87,6 +107,17 @@ with profile_right:
 
 with st.expander("View extracted resume text"):
     st.text_area("Resume text", resume_text, height=220, label_visibility="collapsed")
+
+with st.expander("Parsing diagnostics (no resume content)"):
+    st.write(f"Characters extracted: {len(resume_text)}")
+    st.write(f"Lines extracted: {resume_text.count(chr(10)) + 1}")
+    st.write(f"Projects section found: {'yes' if profile['projects'] else 'no'}")
+    st.write(f"Certifications section found: {'yes' if profile['certifications'] else 'no'}")
+    if not profile["projects"] and not profile["certifications"]:
+        st.caption(
+            "No Projects or Certifications heading was recognised. Recognised headings include "
+            "Projects, Academic Projects, Certifications, Certificates and Courses."
+        )
 
 filtered_jobs = jobs_df[jobs_df["category"].isin(selected_categories)]
 if filtered_jobs.empty:
