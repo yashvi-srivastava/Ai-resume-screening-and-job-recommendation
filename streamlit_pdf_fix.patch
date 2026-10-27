@@ -1,0 +1,415 @@
+diff --git a/app.py b/app.py
+index 82bd784..9903c48 100644
+--- a/app.py
++++ b/app.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import logging
+ import os
+ import sys
+ import tempfile
+@@ -9,6 +10,9 @@ from pathlib import Path
+ 
+ import streamlit as st
+ 
++logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
++logger = logging.getLogger("resume_app")
++
+ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+ 
+ from data_loader import load_job_dataset  # noqa: E402
+@@ -29,11 +33,18 @@ def get_jobs():
+ 
+ def parse_uploaded_resume(uploaded_file) -> str:
+     suffix = Path(uploaded_file.name).suffix.lower()
++    file_bytes = uploaded_file.getvalue()  # bytes of the upload (works on Streamlit Cloud)
++    # Log only the type and size - never the file name or content.
++    logger.info("Upload received: type=%s, size=%d bytes", suffix, len(file_bytes))
++    if not file_bytes:
++        raise ValueError("The uploaded file is empty (0 bytes). Please upload the resume again.")
++
+     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temporary_file:
+-        temporary_file.write(uploaded_file.getvalue())
++        temporary_file.write(file_bytes)
+         temporary_path = temporary_file.name
+     try:
+-        return parse_resume(temporary_path)
++        # preserve_layout keeps line breaks so Projects/Certifications can be found.
++        return parse_resume(temporary_path, preserve_layout=True)
+     finally:
+         Path(temporary_path).unlink(missing_ok=True)
+ 
+@@ -67,8 +78,17 @@ try:
+ except (OSError, ValueError) as error:
+     st.error(f"Resume processing failed: {error}")
+     st.stop()
++except Exception as error:  # unexpected parser failure: show a clean message, log the type only
++    logger.error("Unexpected resume parsing error (%s)", type(error).__name__)
++    st.error("The resume could not be processed. Please try another file or export it again as PDF/DOCX.")
++    st.stop()
+ 
+ profile = extract_profile(resume_text)
++logger.info(
++    "Profile extracted: characters=%d, lines=%d, skills=%d, projects_chars=%d, certifications_chars=%d",
++    len(resume_text), resume_text.count("\n") + 1, len(profile["skills"]),
++    len(profile["projects"]), len(profile["certifications"]),
++)
+ 
+ st.subheader("Extracted Resume Information")
+ profile_left, profile_right = st.columns(2)
+@@ -88,6 +108,17 @@ with profile_right:
+ with st.expander("View extracted resume text"):
+     st.text_area("Resume text", resume_text, height=220, label_visibility="collapsed")
+ 
++with st.expander("Parsing diagnostics (no resume content)"):
++    st.write(f"Characters extracted: {len(resume_text)}")
++    st.write(f"Lines extracted: {resume_text.count(chr(10)) + 1}")
++    st.write(f"Projects section found: {'yes' if profile['projects'] else 'no'}")
++    st.write(f"Certifications section found: {'yes' if profile['certifications'] else 'no'}")
++    if not profile["projects"] and not profile["certifications"]:
++        st.caption(
++            "No Projects or Certifications heading was recognised. Recognised headings include "
++            "Projects, Academic Projects, Certifications, Certificates and Courses."
++        )
++
+ filtered_jobs = jobs_df[jobs_df["category"].isin(selected_categories)]
+ if filtered_jobs.empty:
+     st.warning("No jobs are available for the selected categories.")
+diff --git a/src/resume_parser.py b/src/resume_parser.py
+index 3a61e32..7539361 100644
+--- a/src/resume_parser.py
++++ b/src/resume_parser.py
+@@ -2,24 +2,65 @@
+ resume_parser.py
+ -----------------
+ Extracts raw text from resumes in PDF, DOCX, or TXT format.
++
++Diagnostics are written with the standard `logging` module. Only counts and
++exception type names are logged - never resume text or file names.
+ """
+ 
++import logging
+ import os
+ import re
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def clean_resume_text(text: str) -> str:
+-    """Normalize extracted resume text while preserving its words."""
++    """Normalize extracted resume text into ONE line (line breaks removed)."""
+     return re.sub(r"\s+", " ", text).strip()
+ 
+ 
++def clean_resume_layout(text: str) -> str:
++    """Normalize whitespace inside each line but KEEP the line breaks.
++
++    Section detection (Projects, Certifications, ...) needs line boundaries,
++    so the app uses this instead of clean_resume_text().
++    """
++    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", " ")
++    lines = [re.sub(r"[ \t\u00a0\f\v]+", " ", line).strip() for line in text.split("\n")]
++    # Drop blank lines; keep one line break between non-empty lines.
++    return "\n".join(line for line in lines if line)
++
++
+ def parse_pdf(filepath: str) -> str:
+     import pdfplumber
++
+     text_chunks = []
+-    with pdfplumber.open(filepath) as pdf:
+-        for page in pdf.pages:
+-            page_text = page.extract_text() or ""
+-            text_chunks.append(page_text)
++    empty_pages = 0
++    try:
++        with pdfplumber.open(filepath) as pdf:
++            page_count = len(pdf.pages)
++            for number, page in enumerate(pdf.pages, start=1):
++                try:
++                    page_text = page.extract_text() or ""
++                except Exception as error:  # one bad page must not lose the rest
++                    logger.warning(
++                        "PDF page %d/%d could not be read (%s)",
++                        number, page_count, type(error).__name__,
++                    )
++                    page_text = ""
++                if not page_text.strip():
++                    empty_pages += 1
++                text_chunks.append(page_text)
++    except Exception as error:
++        logger.error("PDF could not be opened (%s)", type(error).__name__)
++        raise ValueError(
++            "The PDF could not be read. It may be corrupted or password-protected."
++        ) from error
++
++    logger.info(
++        "PDF parsed: pages=%d, pages_without_text=%d, characters=%d",
++        page_count, empty_pages, sum(len(chunk) for chunk in text_chunks),
++    )
+     return "\n".join(text_chunks)
+ 
+ 
+@@ -34,8 +75,12 @@ def parse_txt(filepath: str) -> str:
+         return f.read()
+ 
+ 
+-def parse_resume(filepath: str) -> str:
+-    """Dispatch to the right parser based on file extension."""
++def parse_resume(filepath: str, preserve_layout: bool = False) -> str:
++    """Dispatch to the right parser based on file extension.
++
++    preserve_layout=False (default) returns single-line text, exactly as before.
++    preserve_layout=True keeps line breaks so sections can be detected.
++    """
+     ext = os.path.splitext(filepath)[1].lower()
+     if ext == ".pdf":
+         parsed_text = parse_pdf(filepath)
+@@ -46,9 +91,13 @@ def parse_resume(filepath: str) -> str:
+     else:
+         raise ValueError(f"Unsupported file type: {ext}")
+ 
+-    cleaned_text = clean_resume_text(parsed_text)
++    cleaned_text = (
++        clean_resume_layout(parsed_text) if preserve_layout else clean_resume_text(parsed_text)
++    )
+     if not cleaned_text:
+-        raise ValueError("The resume file contains no extractable text")
++        logger.warning("No extractable text found (file type %s)", ext)
++        hint = " Scanned image PDFs need OCR and are not supported." if ext == ".pdf" else ""
++        raise ValueError("The resume file contains no extractable text." + hint)
+     return cleaned_text
+ 
+ 
+diff --git a/src/skill_extractor.py b/src/skill_extractor.py
+index 65fe606..b491b13 100644
+--- a/src/skill_extractor.py
++++ b/src/skill_extractor.py
+@@ -48,15 +48,67 @@ _EXPERIENCE_PATTERNS = [
+     r"(\d+)\+?\s*yrs?\s+experience",
+ ]
+ 
++# Headings that START a section we capture. Keys are the profile fields.
++# Entries are stored in normalized form (see _normalize_heading): lowercase,
++# "&" written as "and", no bullets or trailing colons.
+ _SECTION_NAMES = {
+-    "projects": ("projects", "project experience", "academic projects"),
+-    "certifications": ("certifications", "certificates", "licenses"),
++    "projects": {
++        "projects", "project", "academic projects", "academic project",
++        "personal projects", "personal project", "project experience",
++        "project work", "key projects", "technical projects", "major projects",
++        "minor projects", "mini projects", "selected projects",
++        "projects undertaken", "projects and research",
++    },
++    "certifications": {
++        "certifications", "certification", "certificates", "certificate",
++        "licenses", "licences", "licenses and certifications",
++        "certifications and licenses", "courses", "course",
++        "courses and certifications", "certifications and courses",
++        "online courses", "professional certifications",
++        "training and certifications", "courses and training",
++        "certifications and training",
++    },
+ }
+ 
++# Other common resume headings. They are not captured; they only END the
++# section that is currently open.
++_OTHER_HEADINGS = {
++    "education", "educational qualifications", "academic qualifications",
++    "academics", "qualifications", "education and training",
++    "experience", "work experience", "professional experience",
++    "employment history", "work history", "internships", "internship",
++    "internship experience", "skills", "technical skills", "key skills",
++    "core competencies", "skills and tools", "tools and technologies",
++    "technologies", "summary", "professional summary", "career summary",
++    "career objective", "objective", "profile", "professional profile",
++    "about me", "achievements", "accomplishments", "awards",
++    "awards and achievements", "honors and awards", "publications",
++    "research", "research experience", "extracurricular activities",
++    "extra curricular activities", "co curricular activities", "activities",
++    "positions of responsibility", "volunteer experience", "volunteering",
++    "interests", "hobbies", "hobbies and interests", "languages",
++    "strengths", "references", "declaration", "personal details",
++    "personal information", "contact", "contact information", "workshops",
++}
++
++_MAX_HEADING_WORDS = 6
++_MAX_HEADING_CHARS = 60
++_ALL_HEADINGS = sorted(
++    set().union(*_SECTION_NAMES.values(), _OTHER_HEADINGS), key=len, reverse=True
++)
++# Used only when the text has no line breaks at all: "Projects:" / "Skills:"
++# (with a colon) are treated as headings wherever they appear.
++_INLINE_HEADING_RE = re.compile(
++    r"(?<![A-Za-z])(" + "|".join(re.escape(h).replace(r"\ ", r"\s+") for h in _ALL_HEADINGS) + r")\s*:",
++    re.IGNORECASE,
++)
++
+ 
+ def extract_skills(text: str) -> set:
+     """Return the set of vocabulary skills found in `text`."""
+-    text_lower = text.lower()
++    # Collapse line breaks so a phrase wrapped over two lines
++    # ("machine\nlearning") still matches.
++    text_lower = re.sub(r"\s+", " ", text.lower())
+     found = set()
+     for skill in SKILL_VOCAB:
+         # word-boundary-safe match; handles multi-word skills too
+@@ -68,7 +120,7 @@ def extract_skills(text: str) -> set:
+ 
+ def extract_education_level(text: str) -> int:
+     """Return the highest education level score found (0 if none)."""
+-    text_lower = text.lower()
++    text_lower = re.sub(r"\s+", " ", text.lower())
+     level = 0
+     for keyword, score in EDUCATION_LEVELS.items():
+         if keyword in text_lower:
+@@ -86,26 +138,62 @@ def extract_experience_years(text: str) -> float:
+     return max(years_found) if years_found else 0.0
+ 
+ 
++def _normalize_heading(text: str) -> str:
++    """Lowercase, '&' -> 'and', drop bullets / trailing colons, collapse spaces."""
++    text = text.casefold().replace("&", " and ")
++    text = re.sub(r"^[^a-z0-9]*\d+\s*[.)]\s+", "", text)  # "3. Education" -> "Education"
++    text = re.sub(r"^[^a-z0-9]+", "", text)       # leading bullets, symbols
++    text = re.sub(r"[^a-z0-9]+$", "", text)       # trailing colon, dash, dots
++    text = re.sub(r"[^a-z0-9]+", " ", text)       # inner punctuation -> space
++    return re.sub(r"\s+", " ", text).strip()
++
++
++def _classify_line(line: str):
++    """Return (kind, remainder) if `line` is a heading, otherwise (None, line).
++
++    kind is a profile field ('projects', 'certifications') or 'other'.
++    remainder is any text after "Heading:" on the same line.
++    """
++    candidates = [(line, "")]
++    if ":" in line:
++        head, _, rest = line.partition(":")
++        candidates.insert(0, (head, rest.strip()))
++    for head, rest in candidates:
++        if len(head) > _MAX_HEADING_CHARS:
++            continue
++        key = _normalize_heading(head)
++        if not key or len(key.split()) > _MAX_HEADING_WORDS:
++            continue
++        for section, names in _SECTION_NAMES.items():
++            if key in names:
++                return section, rest
++        if key in _OTHER_HEADINGS:
++            return "other", rest
++    return None, line
++
++
+ def extract_sections(text: str) -> dict[str, str]:
+-    """Return text under recognizable projects and certifications headings."""
++    """Return text under recognizable projects and certifications headings.
++
++    A section runs from its heading until the next recognised heading
++    (including headings such as Education or Skills that are not captured).
++    """
++    if "\n" not in text:
++        # No line breaks at all (e.g. text flattened upstream): put each
++        # "Heading:" on its own line so the normal logic can work.
++        text = _INLINE_HEADING_RE.sub(lambda m: "\n" + m.group(0), text)
++
+     lines = [line.strip() for line in text.splitlines() if line.strip()]
+     sections = {name: "" for name in _SECTION_NAMES}
+     active_section = None
+ 
+     for line in lines:
+-        heading = line.casefold().rstrip(":")
+-        matched_section = next(
+-            (
+-                section
+-                for section, names in _SECTION_NAMES.items()
+-                if heading in names
+-            ),
+-            None,
+-        )
+-        if matched_section:
+-            active_section = matched_section
++        kind, remainder = _classify_line(line)
++        if kind is not None:
++            active_section = kind if kind in sections else None
++            if active_section and remainder:
++                sections[active_section] += f" {remainder}"
+             continue
+-
+         if active_section:
+             sections[active_section] += f" {line}"
+ 
+diff --git a/tests/test_section_detection.py b/tests/test_section_detection.py
+new file mode 100644
+index 0000000..20b1b88
+--- /dev/null
++++ b/tests/test_section_detection.py
+@@ -0,0 +1,64 @@
++import pytest
++
++from src.resume_parser import parse_resume
++from src.skill_extractor import extract_profile, extract_sections
++
++
++RESUME = """Riya Verma
++Data Analyst with 2 years of experience in Python and SQL.
++EDUCATION
++B.Tech in Computer Science
++PROJECTS
++- Sales dashboard using Power BI
++CERTIFICATIONS
++- AWS Cloud Practitioner
++SKILLS
++Python, SQL
++"""
++
++
++def test_sections_end_at_next_recognised_heading():
++    sections = extract_sections(RESUME)
++
++    assert sections["projects"] == "- Sales dashboard using Power BI"
++    assert sections["certifications"] == "- AWS Cloud Practitioner"
++
++
++@pytest.mark.parametrize(
++    "heading",
++    ["Projects", "Academic Projects", "Personal Projects", "PROJECT EXPERIENCE", "Projects:"],
++)
++def test_project_heading_variants(heading):
++    assert extract_sections(f"{heading}\nChat app in Flask\nSkills\nPython")["projects"] == "Chat app in Flask"
++
++
++@pytest.mark.parametrize(
++    "heading",
++    ["Certifications", "Certificates", "Courses", "Courses & Certifications", "Licenses and Certifications"],
++)
++def test_certification_heading_variants(heading):
++    assert extract_sections(f"{heading}\nAWS CCP\nEducation\nB.Tech")["certifications"] == "AWS CCP"
++
++
++def test_parse_resume_can_preserve_line_breaks(tmp_path):
++    path = tmp_path / "resume.txt"
++    path.write_text(RESUME, encoding="utf-8")
++
++    layout_text = parse_resume(str(path), preserve_layout=True)
++    profile = extract_profile(layout_text)
++
++    assert "\n" in layout_text
++    assert "Sales dashboard" in profile["projects"]
++    assert "AWS Cloud Practitioner" in profile["certifications"]
++    # Default behaviour is unchanged: single-line text.
++    assert "\n" not in parse_resume(str(path))
++
++
++def test_heading_word_inside_a_sentence_is_not_a_heading():
++    sections = extract_sections("I led several projects at work\nPython")
++
++    assert sections == {"projects": "", "certifications": ""}
++
++
++def test_skill_phrase_wrapped_over_two_lines_is_still_found():
++    assert "machine learning" in extract_profile("Experienced in machine\nlearning")["skills"]
